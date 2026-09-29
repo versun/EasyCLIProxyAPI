@@ -2472,9 +2472,16 @@ fn main() {
 
     let app = app
         .setup(move |app| {
-            if let Err(error) = network_proxy::refresh(app.state::<GuiConfigState>().inner()) {
-                eprintln!("Failed to read startup proxy settings: {error}");
-            }
+            let proxy_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = network_proxy::refresh_via_api(
+                    proxy_app.state::<GuiConfigState>().inner(),
+                )
+                .await
+                {
+                    eprintln!("Failed to read startup proxy settings: {error}");
+                }
+            });
             if let Err(error) = codex_catalog::validate_embedded_catalog() {
                 eprintln!("Invalid bundled Codex model catalog: {error}");
             }

@@ -1,7 +1,8 @@
+use super::management_api::patch_management_config_if_available;
 use super::{
     agent_managed_paths, apply_gui_managed_settings, consume_software_write,
-    core_config_settings_from_value, core_install_dir, gui_config_path, is_loopback_host,
-    lock_core_config_file, normalized_config_path, path_to_string,
+    core_config_settings_from_value, core_install_dir, gui_api_key_values, gui_config_path,
+    is_loopback_host, lock_core_config_file, normalized_config_path, path_to_string,
     refresh_agent_config_status_cache, request_codex_model_catalog_refresh, validate_gui_config,
     write_core_config_if_changed, AgentClient, AgentConfigStatusCache, ConfigFilesChangedPayload,
     CoreConfigSettings, GuiConfigFile, GuiConfigState, CONFIG_FILES_CHANGED_EVENT,
@@ -54,6 +55,48 @@ fn patch_core_from_gui_config_if_valid(config: &GuiConfigFile) -> Result<(), Str
         .map_err(|error| format!("Failed to read kernel configuration {}: {error}", path_to_string(&path)))?;
     let updated = apply_gui_managed_settings(&content, config)?;
     write_core_config_if_changed(&path, &updated).map(|_| ())
+}
+
+fn gui_managed_v8_patch(config: &GuiConfigFile) -> serde_json::Value {
+    serde_json::json!({
+        "server": {
+            "host": config.host.trim(),
+            "port": config.port,
+            "commercial-mode": config.commercial_mode
+        },
+        "management": {"secret-key": config.management_secret_key},
+        "access": {"api-keys": gui_api_key_values(&config.api_keys)},
+        "oauth": {"auth-dir": config.auth_dir},
+        "observability": {
+            "logs": {
+                "debug": config.debug,
+                "logging-to-file": config.logging_to_file,
+                "logs-max-total-size-mb": config.logs_max_total_size_mb,
+                "error-logs-max-files": config.error_logs_max_files,
+                "request-log": config.request_log
+            },
+            "usage": {
+                "usage-statistics-enabled": config.usage_statistics_enabled,
+                "redis-usage-queue-retention-seconds": config.redis_usage_queue_retention_seconds
+            }
+        },
+        "plugins": {"enabled": config.plugins_enabled},
+        "requests": {
+            "proxy-url": config.proxy_url,
+            "streaming": {"bootstrap-retries": config.streaming_bootstrap_retries}
+        },
+        "routing": {
+            "strategy": config.routing_strategy,
+            "session-affinity": config.routing_session_affinity,
+            "session-affinity-ttl": config.routing_session_affinity_ttl,
+            "cooldown": {"disable-cooling": config.disable_cooling},
+            "retry": {
+                "request-retry": config.request_retry,
+                "max-retry-credentials": config.max_retry_credentials,
+                "max-retry-interval": config.max_retry_interval
+            }
+        }
+    })
 }
 
 fn tracked_configuration_paths(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
@@ -162,9 +205,17 @@ fn handle_configuration_file_changes(
                     }
                 };
                 let result = (|| -> Result<(), String> {
+                    let previous = gui_state.snapshot()?;
                     gui_state.replace_external(config.clone())?;
                     if !preserve_invalid_core_file {
-                        patch_core_from_gui_config_if_valid(&config)?;
+                        let patch = gui_managed_v8_patch(&config);
+                        if gui_managed_v8_patch(&previous) != patch {
+                            if !tauri::async_runtime::block_on(
+                                patch_management_config_if_available(&previous, &patch),
+                            )? {
+                                patch_core_from_gui_config_if_valid(&config)?;
+                            }
+                        }
                     }
                     cache.clear()?;
                     Ok(())

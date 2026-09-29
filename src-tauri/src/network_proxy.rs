@@ -1,5 +1,7 @@
 use super::*;
 
+static PROXY_API_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub(crate) fn normalize_proxy_url(value: &str) -> Result<String, String> {
     let value = value.trim();
     let invalid = || {
@@ -507,75 +509,114 @@ pub(crate) fn normalize_optional_proxy_url(value: &str) -> Result<String, String
     normalize_proxy_url(value)
 }
 
-fn apply(state: &GuiConfigState) -> Result<GuiConfigFile, String> {
-    let snapshot = state
-        .inner
-        .lock()
-        .map_err(|_| "Proxy configuration lock is poisoned".to_string())?
-        .clone();
-    let detected = if snapshot.proxy_override {
-        None
-    } else {
-        Some(detect())
-    };
-    let mut current = state
-        .inner
-        .lock()
-        .map_err(|_| "Proxy configuration lock is poisoned".to_string())?;
-    let mut next = current.clone();
-    next.proxy_url = if next.proxy_override {
-        next.proxy_url.clone()
-    } else {
-        detected.unwrap_or_else(detect)
-    };
-    commit(&mut current, next, patch_core_proxy_url, write_gui_config)?;
-    Ok(current.clone())
-}
-
-fn commit(
-    current: &mut GuiConfigFile,
-    next: GuiConfigFile,
-    mut patch: impl FnMut(&str) -> Result<(), String>,
-    persist: impl FnOnce(&GuiConfigFile) -> Result<(), String>,
+pub(crate) async fn set_manual_via_api(
+    state: &GuiConfigState,
+    proxy_url: String,
 ) -> Result<(), String> {
-    let changed =
-        next.proxy_url != current.proxy_url || next.proxy_override != current.proxy_override;
-    patch(&next.proxy_url)?;
-    if changed {
-        if let Err(error) = persist(&next) {
-            return Err(config_update_error_with_rollback(
-                error,
-                patch(&current.proxy_url).err(),
-            ));
-        }
-        *current = next;
-    }
-    Ok(())
-}
-
-pub(crate) fn refresh(state: &GuiConfigState) -> Result<(), String> {
-    apply(state).map(|_| ())
-}
-
-pub(crate) fn set_manual(state: &GuiConfigState, proxy_url: String) -> Result<(), String> {
+    let _guard = PROXY_API_LOCK.lock().await;
     let proxy_url = normalize_optional_proxy_url(&proxy_url)?;
     let detected = if proxy_url.is_empty() {
         Some(detect())
     } else {
         None
     };
-    let mut current = state
-        .inner
-        .lock()
-        .map_err(|_| "Proxy configuration lock is poisoned".to_string())?;
-    let mut next = current.clone();
-    next.proxy_override = !proxy_url.is_empty();
-    next.proxy_url = if next.proxy_override {
+    let next_proxy_override = !proxy_url.is_empty();
+    let next_proxy_url = if next_proxy_override {
         proxy_url
     } else {
         detected.unwrap_or_else(detect)
     };
-    commit(&mut current, next, patch_core_proxy_url, write_gui_config)
+    apply_via_api(state, next_proxy_url, next_proxy_override).await
+}
+
+pub(crate) async fn refresh_via_api(state: &GuiConfigState) -> Result<(), String> {
+    let _guard = PROXY_API_LOCK.lock().await;
+    let current = state.snapshot()?;
+    let next_proxy_url = resolve(&current);
+    apply_via_api(state, next_proxy_url, current.proxy_override).await
+}
+
+async fn current_management_proxy(
+    config: &GuiConfigFile,
+) -> Result<Option<Option<String>>, String> {
+    let authorization = match management_api::management_authorization(config) {
+        Ok(authorization) => authorization,
+        Err(_) => return Ok(None),
+    };
+    let response = management_api::management_http_client()?
+        .get(management_api::management_endpoint(
+            config,
+            "config/requests/proxy-url",
+        )?)
+        .header("Authorization", authorization)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Ok(None),
+        Err(error) => {
+            return Err(management_api::format_management_request_error(
+                "Failed to read kernel proxy configuration",
+                &error,
+            ));
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Some(None));
+    }
+    let value = management_api::read_management_value(response).await?;
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    value
+        .as_str()
+        .map(|value| Some(Some(value.to_string())))
+        .ok_or_else(|| "Management API returned an invalid proxy configuration".to_string())
+}
+
+async fn apply_via_api(
+    state: &GuiConfigState,
+    next_proxy_url: String,
+    next_proxy_override: bool,
+) -> Result<(), String> {
+    let previous = state.snapshot()?;
+    let patch = serde_json::json!({"requests": {"proxy-url": next_proxy_url}});
+    let current_proxy = current_management_proxy(&previous).await?;
+    let via_api = match current_proxy {
+        Some(Some(current_proxy)) if current_proxy == next_proxy_url => true,
+        None => false,
+        _ => management_api::patch_management_config_if_available(&previous, &patch).await?,
+    };
+    if !via_api {
+        patch_core_proxy_url(&next_proxy_url)?;
+    }
+    let result = if previous.proxy_override != next_proxy_override
+        || previous.proxy_url != next_proxy_url
+    {
+        state.update(|config| {
+            config.proxy_override = next_proxy_override;
+            config.proxy_url = next_proxy_url.clone();
+            Ok(())
+        })
+        .map(|_| ())
+    } else {
+        Ok(())
+    };
+    if let Err(error) = result {
+        let rollback = if via_api {
+            let patch = serde_json::json!({"requests": {"proxy-url": previous.proxy_url}});
+            match management_api::patch_management_config_if_available(&previous, &patch).await {
+                Ok(true) => None,
+                Ok(false) => patch_core_proxy_url(&previous.proxy_url).err(),
+                Err(error) => Some(error),
+            }
+        } else {
+            patch_core_proxy_url(&previous.proxy_url).err()
+        };
+        return Err(config_update_error_with_rollback(error, rollback));
+    }
+    Ok(())
 }
 
 pub(crate) async fn verify_core_proxy(config: &GuiConfigFile) -> Result<(), String> {
@@ -635,7 +676,9 @@ async fn synchronize(app: &tauri::AppHandle, require_core: bool) -> Result<(), S
     let _guard = SYNC_LOCK.lock().await;
     let work_app = app.clone();
     let config = tauri::async_runtime::spawn_blocking(move || {
-        apply(work_app.state::<GuiConfigState>().inner())
+        let state = work_app.state::<GuiConfigState>();
+        tauri::async_runtime::block_on(refresh_via_api(state.inner()))?;
+        state.snapshot()
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -668,62 +711,6 @@ pub(crate) fn start_monitor(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn failed_gui_write_rolls_back_core() {
-        let mut current = GuiConfigFile {
-            proxy_url: "http://localhost:1000".into(),
-            ..GuiConfigFile::default()
-        };
-        let mut next = current.clone();
-        next.proxy_url = "http://localhost:2000".into();
-        let mut writes = Vec::new();
-        let result = commit(
-            &mut current,
-            next,
-            |url| {
-                writes.push(url.to_string());
-                Ok(())
-            },
-            |_| Err("disk full".into()),
-        );
-        assert!(result.is_err());
-        assert_eq!(writes, ["http://localhost:2000", "http://localhost:1000"]);
-        assert_eq!(current.proxy_url, "http://localhost:1000");
-    }
-
-    #[test]
-    fn failed_core_write_never_persists() {
-        let mut current = GuiConfigFile::default();
-        let mut next = current.clone();
-        next.proxy_url = "http://localhost:7890".into();
-        assert!(commit(
-            &mut current,
-            next,
-            |_| Err("read only".into()),
-            |_| panic!("must not persist")
-        )
-        .is_err());
-        assert!(current.proxy_url.is_empty());
-    }
-
-    #[test]
-    fn unchanged_refresh_does_not_rewrite_gui_config() {
-        let mut current = GuiConfigFile::default();
-        let next = current.clone();
-        let mut reconciled = false;
-        commit(
-            &mut current,
-            next,
-            |_| {
-                reconciled = true;
-                Ok(())
-            },
-            |_| panic!("no changes"),
-        )
-        .unwrap();
-        assert!(reconciled);
-    }
 
     #[tokio::test]
     async fn configured_proxy_routes_upstream_but_bypasses_local_management() {
@@ -1001,24 +988,5 @@ mod tests {
             parse_kde_proxy("1", "http://localhost:0", "socks://127.0.0.1:1080", "").unwrap(),
             Some("socks5://127.0.0.1:1080".to_string())
         );
-        let mut current = GuiConfigFile {
-            proxy_url: "http://localhost:1000".into(),
-            ..GuiConfigFile::default()
-        };
-        let mut next = current.clone();
-        next.proxy_override = true;
-        let mut persisted = false;
-        commit(
-            &mut current,
-            next,
-            |_| Ok(()),
-            |_| {
-                persisted = true;
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(persisted);
-        assert!(current.proxy_override);
     }
 }

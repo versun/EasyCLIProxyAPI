@@ -439,7 +439,7 @@ pub(crate) fn start_core_process_with_state(
     process_state: &CoreProcessState,
     gui_config_state: &GuiConfigState,
 ) -> Result<CoreStatus, String> {
-    network_proxy::refresh(gui_config_state)?;
+    tauri::async_runtime::block_on(network_proxy::refresh_via_api(gui_config_state))?;
     let config = gui_config_state.snapshot()?;
     start_core_process_inner(process_state, &config)?;
     if let Err(error) = gui_config_state.set_run_on_startup(true) {
@@ -472,11 +472,11 @@ pub(crate) fn restart_core_process_with_state(
     process_state: &CoreProcessState,
     gui_config_state: &GuiConfigState,
 ) -> Result<CoreStatus, String> {
-    network_proxy::refresh(gui_config_state)?;
-    let config = gui_config_state.snapshot()?;
     if current_core_status(Some(process_state), None)?.running {
         stop_core_process_inner(process_state)?;
     }
+    tauri::async_runtime::block_on(network_proxy::refresh_via_api(gui_config_state))?;
+    let config = gui_config_state.snapshot()?;
     start_core_process_inner(process_state, &config)?;
     if let Err(error) = gui_config_state.set_run_on_startup(true) {
         let _ = stop_core_process_inner(process_state);

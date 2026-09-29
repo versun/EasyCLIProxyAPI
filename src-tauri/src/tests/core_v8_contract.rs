@@ -1,5 +1,6 @@
 use super::support::agent_test_home;
 use super::*;
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
 
 struct TestCore {
@@ -129,6 +130,93 @@ impl TestCore {
 }
 
 #[tokio::test]
+async fn running_core_settings_patch_uses_management_api() {
+    if current_core_tls_settings().is_ok_and(|settings| settings.enabled) {
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut authorization = String::new();
+        let mut content_length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("authorization:") {
+                authorization = line.trim().to_string();
+            }
+            if lower.starts_with("content-length:") {
+                content_length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        let response = r#"{"status":"ok","config-version":8}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+        (
+            request_line,
+            authorization,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        )
+    });
+    let config = GuiConfigFile {
+        host: "127.0.0.1".into(),
+        port,
+        management_secret_key: "test-management-key".into(),
+        ..GuiConfigFile::default()
+    };
+    let fallback_used = std::cell::Cell::new(false);
+    let patch = serde_json::json!({"routing": {"retry": {"request-retry": 2}}});
+    update_core_config(&config, patch.clone(), || {
+        fallback_used.set(true);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (request_line, authorization, body) = server.join().unwrap();
+    assert!(request_line.starts_with("PATCH /v8/management/config HTTP/1.1"));
+    assert_eq!(authorization, "authorization: Bearer test-management-key");
+    assert_eq!(body, patch);
+    assert!(!fallback_used.get());
+}
+
+#[tokio::test]
+async fn offline_core_settings_patch_uses_file_fallback() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = GuiConfigFile {
+        host: "127.0.0.1".into(),
+        port,
+        management_secret_key: "test-management-key".into(),
+        ..GuiConfigFile::default()
+    };
+    let fallback_used = std::cell::Cell::new(false);
+    update_core_config(
+        &config,
+        serde_json::json!({"routing": {"retry": {"request-retry": 2}}}),
+        || {
+            fallback_used.set(true);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert!(fallback_used.get());
+}
+
+#[tokio::test]
 #[ignore = "requires CPA_V8_TEST_CORE pointing to a v8 executable"]
 async fn v8_accepts_gui_settings_and_reloads_client_keys() {
     let executable =
@@ -191,6 +279,26 @@ async fn v8_accepts_gui_settings_and_reloads_client_keys() {
     .unwrap();
     fs::write(&core.config, &content).unwrap();
     core.start().await;
+    update_core_config(
+        &gui,
+        serde_json::json!({
+            "routing": {"retry": {"request-retry": 4}},
+            "requests": {"streaming": {"bootstrap-retries": 1}},
+            "observability": {"logs": {"debug": false}},
+            "oauth": {"providers": {"antigravity": {"sensitive-words": ["live-word"]}}}
+        }),
+        || Err("Running kernel unexpectedly used file fallback".into()),
+    )
+    .await
+    .unwrap();
+    let live_view = core.config_view().await;
+    assert_eq!(live_view["routing"]["retry"]["request-retry"], 4);
+    assert_eq!(live_view["requests"]["streaming"]["bootstrap-retries"], 1);
+    assert_eq!(live_view["observability"]["logs"]["debug"], false);
+    assert_eq!(
+        live_view["oauth"]["providers"]["antigravity"]["sensitive-words"][0],
+        "live-word"
+    );
     let view = core.validate_save(&content).await;
     assert_eq!(view["routing"]["strategy"], "round-robin");
     assert_eq!(view["routing"]["retry"]["request-retry"], 2);
@@ -283,6 +391,106 @@ async fn v8_accepts_gui_settings_and_reloads_client_keys() {
     core.start().await;
     core.wait_for_client_key("client-two", 200).await;
     core.wait_for_client_key("client-one", 401).await;
+}
+
+#[test]
+#[ignore = "requires CPA_V8_TEST_CORE, CPA_V8_TEST_CERT and CPA_V8_TEST_KEY"]
+fn v8_restart_after_disabling_tls() {
+    if env::var_os("CPA_V8_RESTART_TEST_CHILD").is_none() {
+        let directory = agent_test_home("v8-contract-restart");
+        let core = TestCore {
+            child: None,
+            config: directory.join("cpa-core").join(CORE_CONFIG_FILE),
+            executable: directory.join("restart-test.exe"),
+            directory,
+            origin: String::new(),
+            client: reqwest::Client::new(),
+        };
+        let install_dir = core.config.parent().unwrap();
+        fs::create_dir_all(install_dir).unwrap();
+        fs::copy(env::current_exe().unwrap(), &core.executable).unwrap();
+        fs::copy(
+            env::var_os("CPA_V8_TEST_CORE").expect("set CPA_V8_TEST_CORE"),
+            install_dir.join(core_binary_name()),
+        )
+        .unwrap();
+        let mut command = Command::new(&core.executable);
+        command
+            .args([
+                "--exact",
+                "tests::core_v8_contract::v8_restart_after_disabling_tls",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("CPA_V8_RESTART_TEST_CHILD", "1");
+        for variable in ["CPA_V8_TEST_CERT", "CPA_V8_TEST_KEY"] {
+            command.env(
+                variable,
+                fs::canonicalize(env::var_os(variable).expect(variable)).unwrap(),
+            );
+        }
+        configure_background_command(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = GuiConfigFile {
+        host: "127.0.0.1".into(),
+        port,
+        auth_dir: path_to_string(&core_base_dir().unwrap().join("auth")),
+        management_secret_key: "isolated-test-secret".into(),
+        proxy_url: String::new(),
+        proxy_override: true,
+        ..GuiConfigFile::default()
+    };
+    let template = serde_json::json!({
+        "config-version": 8,
+        "management": {"disable-control-panel": true, "disable-auto-update-panel": true},
+        "server": {"tls": {
+            "enable": true,
+            "cert": env::var("CPA_V8_TEST_CERT").unwrap(),
+            "key": env::var("CPA_V8_TEST_KEY").unwrap()
+        }}
+    });
+    fs::write(
+        core_install_dir().unwrap().join(CORE_EXAMPLE_CONFIG_FILE),
+        serde_norway::to_string(&template).unwrap(),
+    )
+    .unwrap();
+    let process = CoreProcessState::new(false);
+    let state = GuiConfigState::new(config.clone());
+    start_core_process_inner(&process, &config).unwrap();
+    let previous_pid = process.managed_pid().unwrap();
+    tauri::async_runtime::block_on(update_core_config(
+        &config,
+        serde_json::json!({"server": {"tls": {"enable": false}}}),
+        || Err("Running HTTPS kernel unexpectedly used file fallback".into()),
+    ))
+    .unwrap();
+    assert!(!current_core_tls_settings().unwrap().enabled);
+
+    let restarted = restart_core_process_with_state(&process, &state);
+    let response = restarted.as_ref().ok().map(|_| {
+        tauri::async_runtime::block_on(
+            management_api::fetch_management_config_if_available(&config),
+        )
+    });
+    let stopped = stop_core_process_inner(&process);
+    let status = restarted.unwrap();
+    assert!(status.running && status.ready);
+    assert_ne!(status.process_id, Some(previous_pid));
+    assert!(response.unwrap().unwrap().is_some());
+    assert!(state.snapshot().unwrap().run_on_startup);
+    stopped.unwrap();
 }
 
 #[tokio::test]

@@ -816,6 +816,35 @@ async function callUpstreamQuota(
   );
 }
 
+const normalizedQuotaRows = (payload: Record<string, unknown>): QuotaRow[] => {
+  const rows = quotaRowsFor('antigravity', payload);
+  const summary = Array.isArray(payload.summary) ? payload.summary : [];
+  summary.forEach((item) => {
+    if (!isRecord(item)) return;
+    const value = numberValue(item.value);
+    const label = readString(item, 'label', 'key');
+    if (value === null || !label) return;
+    const currency = readString(item, 'currency').toUpperCase();
+    const formatted = readString(item, 'format').toLowerCase() === 'currency' && /^[A-Z]{3}$/.test(currency)
+      ? new Intl.NumberFormat(getCurrentLocale(), { style: 'currency', currency }).format(value)
+      : new Intl.NumberFormat(getCurrentLocale(), { maximumFractionDigits: 2 }).format(value);
+    const unit = readString(item, 'unit');
+    rows.push({ label, remainingPercent: null, detail: unit ? `${formatted} ${unit}` : formatted });
+  });
+  return rows;
+};
+
+const fetchNormalizedQuota = async (authIndex: string): Promise<Record<string, unknown> | null> => {
+  try {
+    const payload = await managementApi.post('/credentials/quota/fetch', { auth_index: authIndex });
+    if (!isRecord(payload)) throw new Error(quotaText('quota.service.error.unrecognized'));
+    return payload;
+  } catch (error) {
+    if (/Management API error \(501\)/.test(String(error))) return null;
+    throw error;
+  }
+};
+
 const callCodexResetCredits = async (
   file: AuthFile,
   accountId: string,
@@ -847,8 +876,39 @@ async function loadQuotaSnapshot(file: AuthFile): Promise<QuotaState> {
   }
   try {
     if (booleanValue(file.disabled) === true) throw new Error(quotaText('quota.fileDisabled'));
+    const authIndex = normalizeAuthIndex(file.auth_index ?? file.authIndex);
+    if (!authIndex) throw new Error(quotaText('quota.service.error.missingAuthIndex'));
+    if (provider === 'devin' && !readString(file, 'name')) throw new Error(quotaText('quota.service.error.missingAuthIndex'));
     const codexMetadata = provider === 'codex' ? codexMetadataFor(file) : undefined;
     const codexAccountId = codexMetadata?.accountId || '';
+    const normalized = await fetchNormalizedQuota(authIndex);
+    if (normalized) {
+      const subscription = isRecord(normalized.subscription) ? normalized.subscription : null;
+      const plan = readString(subscription, 'plan', 'tierName', 'tier_name') || codexMetadata?.plan;
+      const rows = normalizedQuotaRows(normalized);
+      if (rows.length === 0 && plan) rows.push({ label: plan, remainingPercent: null });
+      if (rows.length === 0) throw new Error(quotaText('quota.service.error.unrecognized'));
+      let resetCreditsError: string | undefined;
+      const resetCreditDetails = provider === 'codex'
+        ? await callCodexResetCredits(file, codexAccountId).catch((error) => {
+          resetCreditsError = error instanceof Error ? error.message : String(error);
+          return null;
+        })
+        : null;
+      const serverTimeOffsetMs = numberValue(normalized.serverTimeOffsetMs ?? normalized.server_time_offset_ms);
+      return {
+        status: 'success',
+        rows,
+        plan,
+        subscriptionActiveUntil: codexMetadata?.subscriptionActiveUntil,
+        resetCreditsError,
+        resetCredits: resetCreditDetails?.availableCount,
+        resetCreditsApplicable: resetCreditDetails?.applicableAvailableCount,
+        resetCreditsEarliestExpiry: resetCreditDetails?.earliestExpiry,
+        serverTimeOffsetMs: serverTimeOffsetMs ?? undefined,
+        fetchedAt: Date.now(),
+      };
+    }
     const responseClock: { serverTimeOffsetMs?: number } = {};
     const payloadPromise = provider === 'xai'
       ? callXaiQuota(file)

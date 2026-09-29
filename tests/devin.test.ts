@@ -57,7 +57,10 @@ describe('Devin live quota', () => {
     expect(readDevinQuota(liveStatus({ weeklyQuotaResetAtUnix: 1893456000 })).windows[0].remainingPercent).toBeNull();
   });
   it('uses the selected auth index with a body placeholder and shares concurrent refreshes', async () => {
-    const post = spyOn(managementApi, 'post').mockResolvedValue({ status_code: 200, body: liveStatus({ dailyQuotaRemainingPercent: 75, weeklyQuotaRemainingPercent: 50, planInfo: { planName: 'Pro' } }) } as never);
+    const post = spyOn(managementApi, 'post').mockImplementation(async (path) => {
+      if (path === '/credentials/quota/fetch') throw new Error('Management API error (501): no quota provider available for credential');
+      return { status_code: 200, body: liveStatus({ dailyQuotaRemainingPercent: 75, weeklyQuotaRemainingPercent: 50, planInfo: { planName: 'Pro' } }) } as never;
+    });
     const get = spyOn(managementApi, 'get').mockRejectedValue(new Error('Must not download credentials'));
     mocks.push(post, get);
     const first = loadQuota(file);
@@ -65,13 +68,14 @@ describe('Devin live quota', () => {
     expect(first).toBe(second);
     expect(await first).toMatchObject({ status: 'success', plan: 'Pro', rows: [{ remainingPercent: 75 }, { remainingPercent: 50 }] });
     expect(get).not.toHaveBeenCalled();
-    expect(post).toHaveBeenCalledTimes(1);
-    const [path, body] = post.mock.calls[0];
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post.mock.calls[0]).toMatchObject(['/credentials/quota/fetch', { auth_index: 'devin-index' }]);
+    const [path, body] = post.mock.calls[1];
     expect(path).toBe('/api-call');
     expect(body).toMatchObject({ authIndex: 'devin-index', method: 'POST', url: 'https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus', header: { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1' } });
     expect(JSON.parse((body as { data: string }).data)).toEqual({ metadata: { ideName: 'chisel', ideVersion: '3000.10.21', apiKey: '$TOKEN$', locale: 'en', os: 'darwin', extensionVersion: '3000.10.21', clientName: 'chisel' } });
     await loadQuota(file);
-    expect(post).toHaveBeenCalledTimes(2);
+    expect(post).toHaveBeenCalledTimes(4);
   });
   it('refuses disabled credentials and incomplete identities without upstream requests', async () => {
     const post = spyOn(managementApi, 'post');
@@ -82,10 +86,14 @@ describe('Devin live quota', () => {
     expect(post).not.toHaveBeenCalled();
   });
   it('reports upstream errors and empty successful responses', async () => {
-    const post = spyOn(managementApi, 'post').mockResolvedValue({ status_code: 401, body: { error: 'expired' } } as never);
+    let response: unknown = { status_code: 401, body: { error: 'expired' } };
+    const post = spyOn(managementApi, 'post').mockImplementation(async (path) => {
+      if (path === '/credentials/quota/fetch') throw new Error('Management API error (501): no quota provider available for credential');
+      return response as never;
+    });
     mocks.push(post);
     expect(await loadQuota(file)).toMatchObject({ status: 'error', rows: [], error: 'expired' });
-    post.mockResolvedValue({ status_code: 200, body: liveStatus({ planInfo: { planName: 'Pro' } }) } as never);
+    response = { status_code: 200, body: liveStatus({ planInfo: { planName: 'Pro' } }) };
     expect(await loadQuota(file)).toMatchObject({ status: 'error', rows: [] });
   });
 });

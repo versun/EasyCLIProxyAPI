@@ -26,6 +26,7 @@ beforeEach(() => {
   mockIPC((command, payload) => {
     if (command !== 'management_request') throw new Error('Unexpected IPC command: ' + command);
     const request = (payload as { request: { path: string; body: { url: string; method: string } } }).request;
+    if (request.path === '/credentials/quota/fetch') throw new Error('Management API error (501): no quota provider available for credential');
     expect(request.path).toBe('/requests/api-call');
     upstreamCalls.push(request.body);
     if (request.body.url.endsWith('/consume') && consumeError) return { status_code: 409, body: 'reset denied' };

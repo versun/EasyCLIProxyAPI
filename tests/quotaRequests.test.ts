@@ -14,11 +14,20 @@ let post: ReturnType<typeof spyOn>;
 let get: ReturnType<typeof spyOn>;
 let calls: Request[];
 let handler: (request: Request) => unknown | Promise<unknown>;
+let quotaCalls: Record<string, unknown>[];
+let quotaHandler: (body: Record<string, unknown>) => unknown | Promise<unknown>;
 
 beforeEach(() => {
   calls = [];
+  quotaCalls = [];
   handler = () => { throw new Error('Unexpected API request'); };
+  quotaHandler = () => { throw new Error('Management API error (501): no quota provider available for credential'); };
   post = spyOn(managementApi, 'post').mockImplementation(async (path, body) => {
+    if (path === '/credentials/quota/fetch') {
+      const request = body as Record<string, unknown>;
+      quotaCalls.push(request);
+      return await quotaHandler(request) as never;
+    }
     expect(path).toBe('/api-call');
     const request = body as unknown as Request;
     calls.push(request);
@@ -32,6 +41,57 @@ afterEach(() => {
 });
 
 describe('quota API compatibility', () => {
+  it('优先使用 v8 标准化配额并显示分组、摘要、套餐和服务端时间', async () => {
+    quotaHandler = () => ({
+      subscription: { plan: 'Pro' },
+      serverTimeOffsetMs: 1200,
+      groups: [{ displayName: 'Claude', buckets: [{ window: 'weekly', remainingFraction: 0.75, resetTime: '2030-01-01T00:00:00Z' }] }],
+      summary: [{ key: 'balance', label: 'Balance', value: 12.5, format: 'currency', currency: 'USD' }],
+    });
+    const result = await loadQuota({ name: 'claude.json', provider: 'claude', auth_index: 'c' });
+    expect(quotaCalls).toEqual([{ auth_index: 'c' }]);
+    expect(calls).toHaveLength(0);
+    expect(result).toMatchObject({
+      status: 'success', plan: 'Pro', serverTimeOffsetMs: 1200,
+      rows: [
+        { label: 'Claude · weekly', remainingPercent: 75, resetAtMs: Date.parse('2030-01-01T00:00:00Z') },
+        { label: 'Balance', remainingPercent: null },
+      ],
+    });
+    expect(result.rows[1].detail).toContain('$12.50');
+  });
+
+  it('v8 仅提供套餐时仍展示账号状态', async () => {
+    quotaHandler = () => ({ subscription: { tierName: 'Ultra' } });
+    const result = await loadQuota({ name: 'anti.json', provider: 'antigravity', auth_index: 'a' });
+    expect(result).toMatchObject({ status: 'success', plan: 'Ultra', rows: [{ label: 'Ultra', remainingPercent: null }] });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('Codex 标准化配额仍单独读取主动重置次数', async () => {
+    quotaHandler = () => ({ groups: [{ displayName: 'Codex', buckets: [{ window: '5h', remainingFraction: 0.6 }] }] });
+    handler = () => success({ available_count: 2, applicable_available_count: 1, credits: [] });
+    const result = await loadQuota(codexFile);
+    expect(result).toMatchObject({ status: 'success', rows: [{ remainingPercent: 60 }], resetCredits: 2, resetCreditsApplicable: 1 });
+    expect(quotaCalls).toEqual([{ auth_index: '1' }]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('/rate-limit-reset-credits');
+  });
+
+  it('v8 配额提供方失败时保留错误，不重复请求上游', async () => {
+    quotaHandler = () => { throw new Error('Management API error (502): provider failed'); };
+    const result = await loadQuota({ name: 'claude.json', provider: 'claude', auth_index: 'c' });
+    expect(result).toMatchObject({ status: 'error', error: 'Management API error (502): provider failed' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('v8 返回无效数据时不静默切换请求来源', async () => {
+    quotaHandler = () => ({ groups: [] });
+    const result = await loadQuota({ name: 'claude.json', provider: 'claude', auth_index: 'c' });
+    expect(result.status).toBe('error');
+    expect(calls).toHaveLength(0);
+  });
+
   it('Codex 使用新请求头和嵌套账户信息；积分详情失败仍显示用量及 usage 回退次数', async () => {
     handler = (request) => request.url.endsWith('/usage')
       ? success(codexUsage) : { statusCode: 403, bodyText: '{"error":"credits forbidden"}' };
@@ -48,8 +108,9 @@ describe('quota API compatibility', () => {
       expect(call.authIndex).toBe('1');
       expect(call.header.Authorization).toBe('Bearer $TOKEN$');
     }
-    const creditCallIndex = calls.findIndex((call) => call.url.endsWith('/rate-limit-reset-credits'));
-    expect(post.mock.calls[creditCallIndex][2]).toEqual({ timeoutMs: 8000 });
+    const creditCall = post.mock.calls.find((call) => call[0] === '/api-call'
+      && (call[1] as Request).url.endsWith('/rate-limit-reset-credits'));
+    expect(creditCall?.[2]).toEqual({ timeoutMs: 8000 });
   });
 
   it('Codex 保留零次数，usage 的适用次数优先于详情，并优先使用用量接口套餐', async () => {
@@ -154,7 +215,8 @@ describe('xAI quota queries aligned with Management Center', () => {
     expect(calls[1].header).toEqual({
       Authorization: 'Bearer $TOKEN$', accept: 'application/json', 'Content-Type': 'application/json',
     });
-    post.mock.calls.forEach((call) => expect(call[2]).toEqual({ timeoutMs: 15000 }));
+    post.mock.calls.filter((call) => call[0] === '/api-call')
+      .forEach((call) => expect(call[2]).toEqual({ timeoutMs: 15000 }));
   });
 
   it('账单为空后探测成功只显示账户可用，不伪造额度', async () => {

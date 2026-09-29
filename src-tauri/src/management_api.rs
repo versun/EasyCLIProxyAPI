@@ -355,6 +355,77 @@ pub(crate) fn management_endpoint(config: &GuiConfigFile, path: &str) -> Result<
     Ok(format!("{origin}/v8/management/{path}"))
 }
 
+pub(crate) async fn patch_management_config_if_available(
+    config: &GuiConfigFile,
+    patch: &serde_json::Value,
+) -> Result<bool, String> {
+    if !patch.is_object() {
+        return Err("Management configuration patch must be an object".to_string());
+    }
+    let authorization = match management_authorization(config) {
+        Ok(authorization) => authorization,
+        Err(_) => return Ok(false),
+    };
+    let response = management_http_client()?
+        .patch(management_endpoint(config, "config")?)
+        .header("Authorization", authorization)
+        .json(patch)
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Ok(false),
+        Err(error) => {
+            return Err(format_management_request_error(
+                "Failed to update kernel configuration",
+                &error,
+            ));
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    let result = read_management_value(response).await?;
+    if result.get("status").and_then(serde_json::Value::as_str) != Some("ok")
+        || result.get("config-version").and_then(serde_json::Value::as_u64) != Some(8)
+    {
+        return Err("Management API returned an unexpected configuration response".to_string());
+    }
+    Ok(true)
+}
+
+pub(crate) async fn fetch_management_config_if_available(
+    config: &GuiConfigFile,
+) -> Result<Option<serde_json::Value>, String> {
+    let authorization = match management_authorization(config) {
+        Ok(authorization) => authorization,
+        Err(_) => return Ok(None),
+    };
+    let response = management_http_client()?
+        .get(management_endpoint(config, "config")?)
+        .header("Authorization", authorization)
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Ok(None),
+        Err(error) => {
+            return Err(format_management_request_error(
+                "Failed to read kernel configuration",
+                &error,
+            ));
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let value = read_management_value(response).await?;
+    if !value.is_object() {
+        return Err("Management API returned an invalid configuration document".to_string());
+    }
+    Ok(Some(value))
+}
+
 fn normalize_management_oauth_provider(provider: &str) -> Result<String, String> {
     let key = provider.trim().to_ascii_lowercase().replace('_', "-");
     let key = match key.as_str() {
